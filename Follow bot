@@ -1,0 +1,1936 @@
+local Players = game:GetService("Players")
+local PathfindingService = game:GetService("PathfindingService")
+local RunService = game:GetService("RunService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+
+local LocalPlayer = Players.LocalPlayer
+
+local CONFIG = {
+	StopDistance = 2.5,
+	AutoAttack = true,
+	AttackRange = 9,
+	AttackCooldown = 0.15,
+	TargetMoveThreshold = 6,
+	WaypointTimeout = 2.5,
+	StuckTime = 0.8,
+	StuckDistance = 0.6,
+	WaypointSpacing = 3,
+	MaxFollowTime = 8,
+	RepathCooldown = 0.6,
+}
+
+local GRID = {
+	Cell = 3,
+	MaxUp = 5,
+	WalkUp = 0.8,
+	MaxDrop = 14,
+	MaxNodes = 9000,
+	MaxTime = 6,
+	Headroom = 4.6,
+	FollowTime = 25,
+}
+
+local PARKOUR = {
+	Enabled = true,
+	Dirs = 12,
+	Dists = { 2.5, 3.5, 5, 6.5, 8, 9.5, 11, 12.5, 14 },
+	Reach = 0.85,
+	RiseFactor = 0.88,
+	Stretch = 1.4,
+	MaxLinks = 500,
+}
+
+local CLIMB = {
+	MaxHeight = 45,
+	Range = 22,
+	Speed = 22,
+	AnyWall = false,
+	Heuristic = true,
+}
+
+local AGENTS = {
+	{ AgentRadius = 2, AgentHeight = 5 },
+	{ AgentRadius = 1.2, AgentHeight = 5 },
+	{ AgentRadius = 0.8, AgentHeight = 3.5 },
+}
+
+local Bot = {
+	Running = false,
+	Target = nil,
+	Token = 0,
+	Stuck = false,
+	StuckCount = 0,
+	Moving = false,
+	Climbing = false,
+	Leaping = false,
+	Planned = false,
+	Visited = {},
+	Trail = {},
+	Steps = 0,
+	LastDir = nil,
+	NextPathTime = 0,
+	NextClimb = 0,
+	NextLeap = 0,
+	WallTime = 0,
+}
+
+local Failed, Dead = {}, {}
+
+local function keyOf(pos, s)
+	return math.floor(pos.X / s) .. ":" .. math.floor(pos.Z / s) .. ":" .. math.floor(pos.Y / s)
+end
+
+local function markFail(pos)
+	local k = keyOf(pos, 4)
+	local f = Failed[k]
+	if f and os.clock() - f.t < 25 then
+		f.n += 1
+		f.t = os.clock()
+	else
+		Failed[k] = { n = 1, t = os.clock() }
+	end
+end
+
+local function isFailed(pos)
+	local f = Failed[keyOf(pos, 4)]
+	return f ~= nil and f.n >= 2 and os.clock() - f.t < 25
+end
+
+local function markDead(pos)
+	Dead[keyOf(pos, 8)] = os.clock()
+end
+
+local function isDead(pos)
+	local t = Dead[keyOf(pos, 8)]
+	return t ~= nil and os.clock() - t < 40
+end
+
+local function resetMemory()
+	Failed = {}
+	Dead = {}
+	Bot.Visited = {}
+	Bot.Trail = {}
+	Bot.LastDir = nil
+	Bot.StuckCount = 0
+	Bot.Stuck = false
+	Bot.Leaping = false
+	Bot.Planned = false
+	Bot.NextPathTime = 0
+	Bot.NextClimb = 0
+	Bot.NextLeap = 0
+end
+
+local statusCallback = function() end
+local function setStatus(text)
+	statusCallback(text)
+end
+
+local rayParams = RaycastParams.new()
+rayParams.FilterType = Enum.RaycastFilterType.Exclude
+rayParams.RespectCanCollide = true
+
+local function getParts(plr)
+	local char = plr and plr.Character
+	if not char then return end
+	local hum = char:FindFirstChildOfClass("Humanoid")
+	local hrp = char:FindFirstChild("HumanoidRootPart")
+	if hum and hrp and hum.Health > 0 then
+		return char, hum, hrp
+	end
+end
+
+local function active(token)
+	return Bot.Running and Bot.Token == token
+end
+
+local function groundAt(pos, up, len)
+	return workspace:Raycast(pos + Vector3.new(0, up, 0), Vector3.new(0, -len, 0), rayParams)
+end
+
+local function floorY(pos)
+	local hit = groundAt(pos, 1, 10)
+	return hit and hit.Position.Y or pos.Y - 3
+end
+
+local function feetY(hrp)
+	local hit = groundAt(hrp.Position, 0, 8)
+	return hit and hit.Position.Y or hrp.Position.Y - 3
+end
+
+local function flatSpeed(hrp)
+	local v = hrp.AssemblyLinearVelocity
+	return Vector3.new(v.X, 0, v.Z).Magnitude
+end
+
+local function platformAhead(hrp, dir, fy)
+	local a = groundAt(hrp.Position + dir * 3.2, 3, 12)
+	local b = groundAt(hrp.Position + dir * 5.2, 3, 12)
+	return a ~= nil and b ~= nil
+		and math.abs(a.Position.Y - fy) < 4
+		and math.abs(b.Position.Y - fy) < 5
+end
+
+local function safeJump(hum, hrp)
+	if hum.FloorMaterial == Enum.Material.Air then return end
+	if workspace:Raycast(hrp.Position + Vector3.new(0, 2.5, 0), Vector3.new(0, 3.5, 0), rayParams) then
+		return
+	end
+	hum.Jump = true
+end
+
+local function hasLineOfSight(from, to)
+	return workspace:Raycast(from, to - from, rayParams) == nil
+end
+
+local function groundOk(from, to)
+	local flat = (to - from) * Vector3.new(1, 0, 1)
+	local dist = flat.Magnitude
+	if dist < 1 then return true end
+	local dir = flat.Unit
+	local prevY = floorY(from)
+	for d = 2, dist, 2 do
+		local hit = groundAt(from + dir * d, 4, 20)
+		if not hit then return false end
+		local y = hit.Position.Y
+		if prevY - y > 6 or y - prevY > 3.5 then return false end
+		prevY = y
+	end
+	return true
+end
+
+local function clearDist(pos, dir, fy)
+	local maxD = 14
+	local low = workspace:Raycast(pos - Vector3.new(0, 2, 0), dir * maxD, rayParams)
+	local high = workspace:Raycast(pos + Vector3.new(0, 1.5, 0), dir * maxD, rayParams)
+	local d = maxD
+	if low and high then
+		d = math.min(low.Distance, high.Distance)
+	elseif high then
+		d = high.Distance
+	end
+	for s = 3, d, 3 do
+		local g = groundAt(pos + dir * s, 3, 16)
+		if not g or fy - g.Position.Y > 7 then
+			return s - 3
+		end
+	end
+	return d
+end
+
+local function cellKey(p)
+	return math.floor(p.X / 5) .. "," .. math.floor(p.Y / 8) .. "," .. math.floor(p.Z / 5)
+end
+
+local function steerStep(myHum, myHrp, tHrp)
+	local pos = myHrp.Position
+	local fy = floorY(pos)
+	local toT = (tHrp.Position - pos) * Vector3.new(1, 0, 1)
+	local toDir = toT.Magnitude > 0.1 and toT.Unit or Vector3.zAxis
+
+	Bot.Steps += 1
+	if Bot.Steps > 60 then
+		Bot.Visited = {}
+		Bot.Steps = 0
+	end
+
+	if Bot.Stuck then
+		Bot.Stuck = false
+		if Bot.LastDir then
+			local k = cellKey(pos + Bot.LastDir * 6)
+			Bot.Visited[k] = (Bot.Visited[k] or 0) + 3
+		end
+	end
+
+	local bestDir, bestScore, bestClear = nil, -math.huge, 0
+	for i = 0, 15 do
+		local a = i / 16 * math.pi * 2
+		local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+		local cd = clearDist(pos, dir, fy)
+		if cd >= 4 then
+			local ahead = pos + dir * math.min(cd, 8)
+			local score = dir:Dot(toDir) * 2 + math.min(cd, 14) / 14 * 1.5
+			score -= (Bot.Visited[cellKey(ahead)] or 0) * 0.7
+			if isFailed(ahead) then score -= 5 end
+			if Bot.LastDir then
+				score += dir:Dot(Bot.LastDir) * 0.6
+			end
+			if score > bestScore then
+				bestScore, bestDir, bestClear = score, dir, cd
+			end
+		end
+	end
+
+	local key = cellKey(pos)
+	Bot.Visited[key] = (Bot.Visited[key] or 0) + 1
+
+	if bestDir then
+		Bot.LastDir = bestDir
+		if tHrp.Position.Y - pos.Y > 3 and platformAhead(myHrp, bestDir, fy) then
+			safeJump(myHum, myHrp)
+		end
+		myHum:MoveTo(pos + bestDir * math.min(bestClear - 1, 8))
+	else
+		Bot.LastDir = nil
+		safeJump(myHum, myHrp)
+		myHum:MoveTo(pos - toDir * 6)
+	end
+	task.wait(0.35)
+end
+
+local Heap = {}
+Heap.__index = Heap
+
+function Heap.new()
+	return setmetatable({ n = 0, a = {} }, Heap)
+end
+
+function Heap:push(v)
+	self.n += 1
+	local a, i = self.a, self.n
+	a[i] = v
+	while i > 1 do
+		local p = i // 2
+		if a[p].f <= a[i].f then break end
+		a[p], a[i] = a[i], a[p]
+		i = p
+	end
+end
+
+function Heap:pop()
+	local a = self.a
+	local top = a[1]
+	a[1] = a[self.n]
+	a[self.n] = nil
+	self.n -= 1
+	local i, n = 1, self.n
+	while true do
+		local l, r, s = i * 2, i * 2 + 1, i
+		if l <= n and a[l].f < a[s].f then s = l end
+		if r <= n and a[r].f < a[s].f then s = r end
+		if s == i then break end
+		a[s], a[i] = a[i], a[s]
+		i = s
+	end
+	return top
+end
+
+local function snapCell(v)
+	return math.floor(v / GRID.Cell + 0.5)
+end
+
+local function nodeKey(ix, iz, y)
+	return ix .. ":" .. iz .. ":" .. math.floor(y / 2)
+end
+
+local function edgeBlocked(from, to)
+	local ok, res = pcall(function()
+		return workspace:Blockcast(CFrame.new(from), Vector3.new(2.6, 3.4, 2.6), to - from, rayParams)
+	end)
+	if ok then
+		return res ~= nil
+	end
+	if workspace:Raycast(from, to - from, rayParams) then return true end
+	local up = Vector3.new(0, 1.6, 0)
+	return workspace:Raycast(from + up, to - from, rayParams) ~= nil
+end
+
+local function jumpStats(hum)
+	local g = workspace.Gravity
+	local v
+	if hum.UseJumpPower then
+		v = hum.JumpPower
+	else
+		v = math.sqrt(2 * g * hum.JumpHeight)
+	end
+	return { v = v, g = g, speed = math.max(hum.WalkSpeed, 8), h = v * v / (2 * g) }
+end
+
+local function airReach(J, dy)
+	local disc = J.v * J.v - 2 * J.g * dy
+	if disc <= 0 then return 0 end
+	local t = (J.v + math.sqrt(disc)) / J.g
+	return J.speed * t * PARKOUR.Reach
+end
+
+local function takeoffPoint(pos, dir)
+	local last = pos
+	for s = 1, 3 do
+		local p = pos + dir * s
+		local hit = groundAt(p, 2, 6)
+		if not hit or math.abs(hit.Position.Y - pos.Y) > 1.2 then break end
+		if workspace:Raycast(pos + Vector3.new(0, 1.5, 0), dir * s, rayParams) then break end
+		last = hit.Position
+	end
+	return last
+end
+
+local function arcClear(take, dir, d, dy, J)
+	local H = math.max(J.h - dy * 0.5, 1.5)
+	local prev = take + Vector3.new(0, 3, 0)
+	for s = 1, 5 do
+		local f = s / 6
+		local pt = take + dir * (d * f) + Vector3.new(0, 3 + dy * f + 4 * H * f * (1 - f), 0)
+		if workspace:Raycast(prev, pt - prev, rayParams) then
+			return false
+		end
+		prev = pt
+	end
+	return true
+end
+
+local function leapCandidates(p, J)
+	local out = {}
+	local maxD = airReach(J, 0) * PARKOUR.Stretch + 1
+	for i = 0, PARKOUR.Dirs - 1 do
+		local a = i / PARKOUR.Dirs * math.pi * 2
+		local dir = Vector3.new(math.cos(a), 0, math.sin(a))
+		local take = takeoffPoint(p, dir)
+		for _, d in ipairs(PARKOUR.Dists) do
+			if d > maxD then break end
+			local P = take + dir * d
+			local topY = take.Y + J.h * 1.3 + 1.5
+			local hit = workspace:Raycast(
+				Vector3.new(P.X, topY, P.Z),
+				Vector3.new(0, -(topY - take.Y + GRID.MaxDrop), 0),
+				rayParams
+			)
+			if hit and hit.Normal.Y > 0.6 then
+				local np = hit.Position
+				local dy = np.Y - take.Y
+				local ok, stretch = false, false
+				if dy >= -GRID.MaxDrop then
+					if dy <= J.h * PARKOUR.RiseFactor and d <= airReach(J, dy) then
+						ok = true
+					elseif PARKOUR.Stretch > 1 and dy <= J.h * 1.3 then
+						local sr = airReach(J, math.min(dy, J.h * 0.9)) * PARKOUR.Stretch
+						if d <= math.max(sr, 3) then
+							ok, stretch = true, true
+						end
+					end
+				end
+				if ok then
+					local trivial = false
+					if math.abs(dy) < 1.5 then
+						local mid = groundAt(take + dir * (d * 0.5), 2, 8)
+						if mid and math.abs(mid.Position.Y - take.Y) < 1.5 then
+							trivial = true
+						end
+					end
+					if not trivial then
+						local roof = workspace:Raycast(
+							np + Vector3.new(0, 0.3, 0),
+							Vector3.new(0, GRID.Headroom, 0),
+							rayParams
+						)
+						local beyond = groundAt(np + dir * 0.8, 2, 5)
+						local landOk = (not roof)
+							and (stretch or (beyond and math.abs(beyond.Position.Y - np.Y) < 1))
+						if landOk and arcClear(take, dir, d, dy, J) then
+							local safe = workspace:Raycast(
+								take + dir * (d * 0.5),
+								Vector3.new(0, -80, 0),
+								rayParams
+							) ~= nil
+							table.insert(out, {
+								pos = np, take = take, d = d, dy = dy,
+								stretch = stretch, safe = safe,
+							})
+						end
+					end
+				end
+			end
+		end
+	end
+	return out
+end
+
+local function wallToward(p, goalPos)
+	local f = Vector3.new(goalPos.X - p.X, 0, goalPos.Z - p.Z)
+	if f.Magnitude < 1 then return false end
+	local dir = f.Unit * 7
+	local a = workspace:Raycast(p + Vector3.new(0, 1, 0), dir, rayParams)
+	local b = workspace:Raycast(p + Vector3.new(0, 3.5, 0), dir, rayParams)
+	return a ~= nil and b ~= nil
+end
+
+local function pickFallback(nodes, startNode, goalPos)
+	local regions = {}
+	for _, nd in pairs(nodes) do
+		if nd ~= startNode and not isDead(nd.pos)
+			and (nd.pos - startNode.pos).Magnitude > 6 then
+			local k = keyOf(nd.pos, 10)
+			local r = regions[k]
+			if not r or nd.h < r.h then
+				regions[k] = nd
+			end
+		end
+	end
+
+	local cands = {}
+	for _, nd in pairs(regions) do
+		table.insert(cands, nd)
+	end
+	table.sort(cands, function(a, b)
+		return a.h < b.h
+	end)
+
+	local best, bestScore = nil, math.huge
+	for i = 1, math.min(#cands, 40) do
+		local nd = cands[i]
+		local score = nd.h + nd.g * 0.15 + (Bot.Visited[cellKey(nd.pos)] or 0) * 6
+		if wallToward(nd.pos, goalPos) then
+			score += 30
+		end
+		if score < bestScore then
+			best, bestScore = nd, score
+		end
+	end
+	return best
+end
+
+local function gridPath(myHrp, tHrp, token, myHum)
+	local J = jumpStats(myHum)
+	local startHit = groundAt(myHrp.Position, 1, 12)
+	local goalHit = groundAt(tHrp.Position, 1, 40)
+	local startPos = startHit and startHit.Position or (myHrp.Position - Vector3.new(0, 3, 0))
+	local goalPos = goalHit and goalHit.Position or (tHrp.Position - Vector3.new(0, 3, 0))
+
+	local function h(p)
+		local d = p - goalPos
+		return Vector3.new(d.X, d.Y * 2, d.Z).Magnitude
+	end
+
+	local sx, sz = snapCell(startPos.X), snapCell(startPos.Z)
+	local startNode = {
+		pos = startPos, ix = sx, iz = sz,
+		key = nodeKey(sx, sz, startPos.Y), g = 0,
+		h = h(startPos), f = h(startPos),
+	}
+
+	local open = Heap.new()
+	open:push(startNode)
+	local nodes = { [startNode.key] = startNode }
+	local closed = {}
+	local found = nil
+	local expanded = 0
+	local linkCalls = 0
+	local t0 = os.clock()
+	local lastYield = t0
+
+	local function consider(cur, nx, nz, len)
+		local p = cur.pos
+		local x, z = nx * GRID.Cell, nz * GRID.Cell
+		local hit = workspace:Raycast(
+			Vector3.new(x, p.Y + GRID.MaxUp, z),
+			Vector3.new(0, -(GRID.MaxUp + GRID.MaxDrop), 0),
+			rayParams
+		)
+		if not (hit and hit.Normal.Y > 0.6) then
+			return false
+		end
+		local np = hit.Position
+		local dy = np.Y - p.Y
+		local key = nodeKey(nx, nz, np.Y)
+		if closed[key] then return true end
+		if isFailed(np) then return false end
+
+		local roof = workspace:Raycast(
+			np + Vector3.new(0, 0.3, 0),
+			Vector3.new(0, GRID.Headroom, 0),
+			rayParams
+		)
+		if roof then return false end
+
+		local top = math.max(p.Y, np.Y) + 3.3
+		local from = Vector3.new(p.X, top, p.Z)
+		local to = Vector3.new(np.X, top, np.Z)
+		if edgeBlocked(from, to) then return false end
+
+		local cost = len
+		if dy > GRID.WalkUp then
+			cost += 1 + dy * 0.5
+		elseif dy < -3 then
+			cost += (-dy) * 1.5
+		end
+
+		local g = cur.g + cost
+		local ex = nodes[key]
+		if not ex or g < ex.g then
+			local node = {
+				pos = np, ix = nx, iz = nz, key = key,
+				g = g, parent = cur,
+				jump = dy > GRID.WalkUp,
+			}
+			node.h = h(np)
+			node.f = g + node.h
+			nodes[key] = node
+			open:push(node)
+		end
+		return true
+	end
+
+	local function addLinks(cur)
+		local p = cur.pos
+		for _, c in ipairs(leapCandidates(p, J)) do
+			local np = c.pos
+			local key = nodeKey(snapCell(np.X), snapCell(np.Z), np.Y)
+			if not closed[key] and not isFailed(np) then
+				local cost = (c.take - p).Magnitude + c.d + 5 + math.max(c.dy, 0) * 0.8
+				cost += math.max(-c.dy, 0) * 1.5
+				if c.stretch then cost += 12 end
+				if not c.safe then cost += 15 end
+				local g = cur.g + cost
+				local ex = nodes[key]
+				if not ex or g < ex.g then
+					local node = {
+						pos = np,
+						ix = snapCell(np.X), iz = snapCell(np.Z),
+						key = key, g = g, parent = cur,
+						jump = true, link = true, takeoff = c.take,
+					}
+					node.h = h(np)
+					node.f = g + node.h
+					nodes[key] = node
+					open:push(node)
+				end
+			end
+		end
+	end
+
+	while open.n > 0 do
+		local cur = open:pop()
+		if not closed[cur.key] then
+			closed[cur.key] = true
+			expanded += 1
+			local p = cur.pos
+
+			local dx, dz = p.X - goalPos.X, p.Z - goalPos.Z
+			if dx * dx + dz * dz <= 16 and math.abs(p.Y - goalPos.Y) <= 5 then
+				found = cur
+				break
+			end
+
+			if expanded > GRID.MaxNodes or os.clock() - t0 > GRID.MaxTime then
+				break
+			end
+			if os.clock() - lastYield > 0.010 then
+				task.wait()
+				lastYield = os.clock()
+				if not active(token) then return end
+			end
+
+			local walkCount = 0
+			for ox = -1, 1 do
+				for oz = -1, 1 do
+					if ox ~= 0 or oz ~= 0 then
+						local len = (ox ~= 0 and oz ~= 0) and GRID.Cell * 1.414 or GRID.Cell
+						if consider(cur, cur.ix + ox, cur.iz + oz, len) then
+							walkCount += 1
+						end
+					end
+				end
+			end
+
+			if PARKOUR.Enabled and walkCount < 8 and linkCalls < PARKOUR.MaxLinks then
+				linkCalls += 1
+				addLinks(cur)
+			end
+		end
+	end
+
+	local last = found or pickFallback(nodes, startNode, goalPos)
+	if not last then return end
+
+	local chain = {}
+	local n = last
+	while n do
+		table.insert(chain, 1, n)
+		n = n.parent
+	end
+
+local waypoints = {}
+ for _, node in ipairs(chain) do
+  table.insert(waypoints, {
+   Position = node.pos,
+   Action = node.jump and Enum.PathWaypointAction.Jump or Enum.PathWaypointAction.Walk,
+   Kind = node.link and "leap" or nil,
+   Takeoff = node.takeoff,
+  })
+ end
+
+ return waypoints, found ~= nil
+end
+
+local function partAABB(p)
+ local cf, s = p.CFrame, p.Size
+ local r, u, l = cf.RightVector, cf.UpVector, cf.LookVector
+ local ext = Vector3.new(
+  (math.abs(r.X) * s.X + math.abs(u.X) * s.Y + math.abs(l.X) * s.Z) / 2,
+  (math.abs(r.Y) * s.X + math.abs(u.Y) * s.Y + math.abs(l.Y) * s.Z) / 2,
+  (math.abs(r.Z) * s.X + math.abs(u.Z) * s.Y + math.abs(l.Z) * s.Z) / 2
+ )
+ return cf.Position - ext, cf.Position + ext
+end
+
+local function modelAABB(m)
+ local mn, mx
+ local cnt = 0
+ for _, d in ipairs(m:GetDescendants()) do
+  if d:IsA("BasePart") then
+   cnt += 1
+   if cnt > 80 then return nil end
+   local a, b = partAABB(d)
+   if mn then
+    mn = Vector3.new(math.min(mn.X, a.X), math.min(mn.Y, a.Y), math.min(mn.Z, a.Z))
+    mx = Vector3.new(math.max(mx.X, b.X), math.max(mx.Y, b.Y), math.max(mx.Z, b.Z))
+   else
+    mn, mx = a, b
+   end
+  end
+ end
+ if not mn then return nil end
+ return mn, mx, cnt
+end
+
+local function climbUnit(part, cache)
+ local unit = part
+ local mn, mx = partAABB(part)
+ local count = 1
+ local m = part.Parent
+ while m and m ~= workspace and m:IsA("Model") do
+  if m:FindFirstChildOfClass("Humanoid") then break end
+  local c = cache[m]
+  if c == nil then
+   local a, b, n = modelAABB(m)
+   if a then
+    c = { a = a, b = b, n = n }
+   else
+    c = false
+   end
+   cache[m] = c
+  end
+  if not c then break end
+  local s = c.b - c.a
+  if s.X > 14 or s.Z > 14 or s.Y > 60 then break end
+  unit, mn, mx, count = m, c.a, c.b, c.n
+  m = m.Parent
+ end
+ return unit, mn, mx, count
+end
+
+local function nameHas(inst)
+ local n = inst.Name:lower()
+ for _, w in ipairs({ "ladder", "truss", "climb", "лестниц" }) do
+  if n:find(w, 1, true) then return true end
+ end
+ return false
+end
+
+local function ladderLikeUnit(unit, part, mn, mx, count)
+ if part:IsA("TrussPart") then return true end
+ if nameHas(part) or nameHas(unit) then return true end
+ if unit ~= part then
+  if unit.Parent and unit.Parent ~= workspace and nameHas(unit.Parent) then return true end
+  for _, d in ipairs(unit:GetDescendants()) do
+   if d:IsA("TrussPart") then return true end
+  end
+ end
+ if not CLIMB.Heuristic then return false end
+ local s = mx - mn
+ return unit ~= part and count >= 4 and s.Y >= 8 and math.min(s.X, s.Z) <= 6
+end
+
+local function findTopLanding(c, hx, hz, top, n, pos)
+ local lat = Vector3.new(n.Z, 0, -n.X)
+ local dirs = { -n, lat, -lat, n }
+ for _, dir in ipairs(dirs) do
+  local half = math.abs(dir.X) * hx + math.abs(dir.Z) * hz
+  local perp = Vector3.new(dir.Z, 0, -dir.X)
+  for _, d in ipairs({ 2, 3.5, 5.5 }) do
+   for _, s in ipairs({ 0, 2.5, -2.5 }) do
+    local p = Vector3.new(c.X, 0, c.Z) + dir * (half + d) + perp * s
+    local g = workspace:Raycast(
+     Vector3.new(p.X, top + 5, p.Z),
+     Vector3.new(0, -14, 0),
+     rayParams
+    )
+    if g and g.Normal.Y > 0.6
+     and g.Position.Y > top - 3 and g.Position.Y < top + 4
+     and g.Position.Y > pos.Y + 3 then
+     return g.Position
+    end
+   end
+  end
+ end
+end
+
+local function findClimb(myHrp, tHrp)
+	local pos = myHrp.Position
+	local goal = tHrp.Position
+	local function hv(p)
+		local d = p - goal
+		return Vector3.new(d.X, d.Y * 2, d.Z).Magnitude
+	end
+	local cur = hv(pos)
+	local feet = floorY(pos)
+
+	local op = OverlapParams.new()
+	op.FilterType = Enum.RaycastFilterType.Exclude
+	op.FilterDescendantsInstances = rayParams.FilterDescendantsInstances
+
+	local parts = workspace:GetPartBoundsInRadius(pos, CLIMB.Range, op)
+	local cache, seen = {}, {}
+	local best, bestScore = nil, -math.huge
+	local checked = 0
+
+	for _, part in ipairs(parts) do
+		if checked > 250 then break end
+		local small = part:IsA("TrussPart") or part.Size.Magnitude <= 30
+		if small and (part.CanCollide or part:IsA("TrussPart")) then
+			checked += 1
+			local unit, mn, mx, count = climbUnit(part, cache)
+			if not seen[unit] then
+				seen[unit] = true
+				local rise = mx.Y - pos.Y
+				if rise > 3.5 and rise <= CLIMB.MaxHeight and mn.Y < pos.Y + 5 then
+					local ladder = ladderLikeUnit(unit, part, mn, mx, count)
+					if ladder or CLIMB.AnyWall then
+						local s = mx - mn
+						local c = (mn + mx) / 2
+						local hx, hz = s.X / 2, s.Z / 2
+						local sides = {
+							{ n = Vector3.new(1, 0, 0), broad = s.Z >= s.X },
+							{ n = Vector3.new(-1, 0, 0), broad = s.Z >= s.X },
+							{ n = Vector3.new(0, 0, 1), broad = s.X >= s.Z },
+							{ n = Vector3.new(0, 0, -1), broad = s.X >= s.Z },
+						}
+						for _, sd in ipairs(sides) do
+							local n = sd.n
+							local lat = Vector3.new(n.Z, 0, -n.X)
+							local latHalf = math.abs(lat.X) * hx + math.abs(lat.Z) * hz
+							local along = math.clamp((pos - c):Dot(lat), -latHalf * 0.6, latHalf * 0.6)
+							local faceDist = math.abs(n.X) * hx + math.abs(n.Z) * hz
+							local hit = Vector3.new(c.X, pos.Y, c.Z) + n * faceDist + lat * along
+							local stand = hit + n * 1.6
+							local g = groundAt(stand, 3, 10)
+							if g and math.abs(g.Position.Y - feet) < 4 then
+								local landing = findTopLanding(c, hx, hz, mx.Y, n, pos)
+								if landing and hv(landing) < cur - 2 then
+									local score = -hv(landing)
+										- (pos - stand).Magnitude * 0.5
+										+ (sd.broad and 4 or 0)
+										+ (ladder and 30 or 0)
+									if score > bestScore then
+										bestScore = score
+										best = {
+											hit = hit,
+											normal = n,
+											top = mx.Y,
+											landing = landing,
+											stand = stand,
+											unit = unit,
+										}
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+	return best
+end
+
+local function doClimb(c, myHum, myHrp, token)
+	Bot.Climbing = true
+	Bot.Moving = false
+	local n = c.normal
+	local into = -n
+	local stand = c.stand
+
+	local t0 = os.clock()
+	while active(token) and os.clock() - t0 < 5 do
+		myHum:MoveTo(Vector3.new(stand.X, myHrp.Position.Y, stand.Z))
+		task.wait(0.05)
+		local flat = (myHrp.Position - stand) * Vector3.new(1, 0, 1)
+		if flat.Magnitude < 1.3 then break end
+	end
+
+	local failed = false
+	local t1 = os.clock()
+	local lastY, lastT = myHrp.Position.Y, os.clock()
+	while active(token) and os.clock() - t1 < 10 do
+		local pos = myHrp.Position
+		if pos.Y >= c.top + 1.2 then break end
+
+		if pos.Y < c.top - 5 then
+			local up = workspace:Raycast(pos + Vector3.new(0, 2.5, 0), Vector3.new(0, 3, 0), rayParams)
+			if up and not up.Instance:IsDescendantOf(c.unit) and up.Instance ~= c.unit then
+				failed = true
+				break
+			end
+		end
+
+		if os.clock() - lastT > 1.2 then
+			if pos.Y - lastY < 1 then
+				failed = true
+				break
+			end
+			lastY, lastT = pos.Y, os.clock()
+		end
+
+		local d = (pos - c.hit):Dot(n)
+		local pull = math.clamp((d - 1.2) * 6, 0, 10)
+		myHrp.CFrame = CFrame.lookAt(pos, pos + into)
+		myHum:MoveTo(pos + into * 3)
+		myHrp.AssemblyLinearVelocity = Vector3.new(
+			into.X * (3 + pull),
+			CLIMB.Speed,
+			into.Z * (3 + pull)
+		)
+		task.wait()
+	end
+
+	if not failed then
+		local land = c.landing
+		local t2 = os.clock()
+		myHum.Jump = true
+		while active(token) and os.clock() - t2 < 3 do
+			local pos = myHrp.Position
+			local toLand = Vector3.new(land.X - pos.X, 0, land.Z - pos.Z)
+			myHum:MoveTo(land)
+			if os.clock() - t2 < 0.3 then
+				local dl = toLand.Magnitude > 0.1 and toLand.Unit or into
+				myHrp.AssemblyLinearVelocity = Vector3.new(dl.X * 10, 15, dl.Z * 10)
+			end
+			if toLand.Magnitude < 2 and myHum.FloorMaterial ~= Enum.Material.Air then break end
+			if pos.Y < land.Y - 6 then
+				failed = true
+				break
+			end
+			task.wait(0.05)
+		end
+	end
+
+	if failed then
+		markFail(c.stand)
+		markFail(c.stand)
+	end
+
+	Bot.Climbing = false
+end
+
+local function tryClimb(myHum, myHrp, tHrp, token)
+	local c = findClimb(myHrp, tHrp)
+	if not c then return false end
+	setStatus("Лезу по лестнице...")
+	doClimb(c, myHum, myHrp, token)
+	return true
+end
+
+local function snapGoal(tHrp)
+	local hit = groundAt(tHrp.Position, 0, 40)
+	if hit then
+		return hit.Position
+	end
+	return tHrp.Position
+end
+
+local function findPath(myHrp, tHrp, token)
+	local goal = snapGoal(tHrp)
+	for _, agent in ipairs(AGENTS) do
+		if not active(token) then return end
+		local path = PathfindingService:CreatePath({
+			AgentRadius = agent.AgentRadius,
+			AgentHeight = agent.AgentHeight,
+			AgentCanJump = true,
+			AgentCanClimb = true,
+			WaypointSpacing = CONFIG.WaypointSpacing,
+			Costs = { Water = 20 },
+		})
+		local ok = pcall(function()
+			path:ComputeAsync(myHrp.Position, goal)
+		end)
+		if ok and path.Status == Enum.PathStatus.Success then
+			return path
+		end
+	end
+end
+
+local function toList(path)
+	local list = {}
+	for _, w in ipairs(path:GetWaypoints()) do
+		table.insert(list, { Position = w.Position, Action = w.Action, Native = true })
+	end
+	return list
+end
+
+local function getSword()
+	local char = LocalPlayer.Character
+	if not char then return end
+	local equipped = char:FindFirstChildOfClass("Tool")
+	if equipped then return equipped end
+	local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+	if backpack then
+		for _, t in ipairs(backpack:GetChildren()) do
+			if t:IsA("Tool") then
+				return t
+			end
+		end
+	end
+end
+
+local function faceTarget(myHrp, tHrp)
+	local look = Vector3.new(tHrp.Position.X, myHrp.Position.Y, tHrp.Position.Z)
+	if (look - myHrp.Position).Magnitude > 0.1 then
+		myHrp.CFrame = CFrame.lookAt(myHrp.Position, look)
+	end
+end
+
+local Sword = nil
+
+local function attackLoop(token)
+	while active(token) do
+		local _, myHum, myHrp = getParts(LocalPlayer)
+		local _, _, tHrp = getParts(Bot.Target)
+
+		if CONFIG.AutoAttack and myHum and tHrp and not Bot.Climbing and not Bot.Leaping
+			and (tHrp.Position - myHrp.Position).Magnitude <= CONFIG.AttackRange then
+
+			local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+			if not Sword or not Sword.Parent
+				or (Sword.Parent ~= LocalPlayer.Character and Sword.Parent ~= backpack) then
+				Sword = getSword()
+			end
+
+			if Sword then
+				if Sword.Parent ~= LocalPlayer.Character then
+					myHum:EquipTool(Sword)
+					task.wait(0.1)
+				end
+				faceTarget(myHrp, tHrp)
+				pcall(function()
+					Sword:Activate()
+				end)
+			end
+			task.wait(CONFIG.AttackCooldown)
+		else
+			task.wait(0.1)
+		end
+	end
+end
+
+local lastPos, lastCheck = nil, 0
+RunService.Heartbeat:Connect(function()
+	if not Bot.Running or Bot.Climbing or Bot.Leaping then
+		lastPos = nil
+		return
+	end
+	local _, hum, hrp = getParts(LocalPlayer)
+	if not hum then return end
+
+	local now = os.clock()
+	local dir = hum.MoveDirection
+
+	if Bot.Moving and dir.Magnitude > 0.1 and hum.FloorMaterial ~= Enum.Material.Air then
+		local flatDir = Vector3.new(dir.X, 0, dir.Z).Unit
+		local fy = floorY(hrp.Position)
+
+		local low = workspace:Raycast(hrp.Position - Vector3.new(0, 2, 0), flatDir * 3.5, rayParams)
+		local high = workspace:Raycast(hrp.Position + Vector3.new(0, 1.5, 0), flatDir * 3.5, rayParams)
+		local ahead = groundAt(hrp.Position + flatDir * 3, 4, 10)
+		local rise = ahead and (ahead.Position.Y - fy) or 0
+		local slow = flatSpeed(hrp) < hum.WalkSpeed * 0.45
+		local safeLand = platformAhead(hrp, flatDir, fy)
+
+		if low and high then
+			if ahead and rise > 0.6 and rise < 7 and safeLand and (slow or rise > 1.3) then
+				safeJump(hum, hrp)
+			elseif low.Distance < 2.5 and high.Distance < 2.5 and slow and now - Bot.WallTime > 0.6 then
+				Bot.WallTime = now
+				Bot.Stuck = true
+			end
+		elseif low and not high then
+			if safeLand or slow then
+				safeJump(hum, hrp)
+			end
+		elseif ahead and rise > 1.3 and rise < 7 and safeLand then
+			safeJump(hum, hrp)
+		elseif ahead and rise > 0.6 and slow and safeLand then
+			safeJump(hum, hrp)
+		end
+
+		if not Bot.Planned then
+			local near = groundAt(hrp.Position + flatDir * 2.6, 3, 16)
+			local drop = near and (fy - near.Position.Y) or math.huge
+			if drop > 2.5 then
+				local landing = nil
+				for _, d in ipairs({ 4.5, 6.5, 8.5 }) do
+					local g = groundAt(hrp.Position + flatDir * d, 3, 16)
+					if g and math.abs(g.Position.Y - fy) < 3.5 then
+						landing = g
+						break
+					end
+				end
+				if landing then
+					safeJump(hum, hrp)
+				elseif drop > 10 then
+					hum:MoveTo(hrp.Position)
+					Bot.Stuck = true
+				end
+			end
+		end
+	end
+
+	if Bot.Moving then
+		if not lastPos then
+			lastPos, lastCheck = hrp.Position, now
+		elseif now - lastCheck >= CONFIG.StuckTime then
+			if (hrp.Position - lastPos).Magnitude < CONFIG.StuckDistance then
+				Bot.Stuck = true
+				Bot.StuckCount += 1
+				safeJump(hum, hrp)
+			else
+				Bot.StuckCount = 0
+				if hum.FloorMaterial ~= Enum.Material.Air then
+					local t = Bot.Trail
+					local last = t[#t]
+					if not last or (last - hrp.Position).Magnitude > 6 then
+						table.insert(t, hrp.Position)
+						if #t > 6 then table.remove(t, 1) end
+					end
+				end
+			end
+			lastPos, lastCheck = hrp.Position, now
+		end
+	else
+		lastPos = nil
+	end
+end)
+
+local function doLeap(wp, myHum, myHrp, token)
+	local land = wp.Position
+	local take = wp.Takeoff
+	if not take then return false end
+	local flat = (land - take) * Vector3.new(1, 0, 1)
+	if flat.Magnitude < 0.1 then return true end
+	local dir = flat.Unit
+	local beyond = take + dir * (flat.Magnitude + 4)
+
+	setStatus("Паркур: прыжок")
+	local t0 = os.clock()
+	local tj = nil
+
+	while active(token) and os.clock() - t0 < 4 do
+		RunService.Heartbeat:Wait()
+		if not myHrp.Parent then return false end
+		local pos = myHrp.Position
+		local grounded = myHum.FloorMaterial ~= Enum.Material.Air
+
+		if not tj then
+			local toTake = (take - pos) * Vector3.new(1, 0, 1)
+			local along = toTake:Dot(dir)
+			local lateral = (toTake - dir * along).Magnitude
+			if toTake.Magnitude > 3.5 or lateral > 1.2 then
+				myHum:MoveTo(Vector3.new(take.X, pos.Y, take.Z))
+			else
+				myHum:MoveTo(Vector3.new(beyond.X, pos.Y, beyond.Z))
+			end
+			if grounded and toTake.Magnitude < 3.5 and lateral < 1.6 and along < 0.9 then
+				tj = os.clock()
+				myHum.Jump = true
+			end
+		else
+			myHum:MoveTo(Vector3.new(beyond.X, pos.Y, beyond.Z))
+			local since = os.clock() - tj
+			if since > 0.2 and grounded then
+				local flatToLand = ((pos - land) * Vector3.new(1, 0, 1)).Magnitude
+				return flatToLand < 4 and math.abs(feetY(myHrp) - land.Y) < 3.5
+			end
+			if pos.Y < land.Y - 15 or since > 2 then
+				return false
+			end
+		end
+	end
+	return false
+end
+
+local function desperateLeap(myHum, myHrp, tHrp, token)
+	if not PARKOUR.Enabled then return false end
+	if myHum.FloorMaterial == Enum.Material.Air then return false end
+
+	local J = jumpStats(myHum)
+	local ground = groundAt(myHrp.Position, 1, 12)
+	local p = ground and ground.Position or (myHrp.Position - Vector3.new(0, 3, 0))
+	local goal = snapGoal(tHrp)
+	local targetAbove = tHrp.Position.Y - p.Y > 4
+
+	local function hval(q)
+		local d = q - goal
+		return Vector3.new(d.X, d.Y * 2, d.Z).Magnitude
+	end
+
+	local now = hval(p)
+	local best, bestScore = nil, math.huge
+	for _, c in ipairs(leapCandidates(p, J)) do
+		if not isFailed(c.pos) and not (targetAbove and c.dy < -2) then
+			local hv = hval(c.pos)
+			if hv < now - 1.5 then
+				local score = hv
+					+ (c.stretch and 4 or 0)
+					+ (c.safe and 0 or 10)
+					+ (Bot.Visited[cellKey(c.pos)] or 0) * 3
+				if score < bestScore then
+					best, bestScore = c, score
+				end
+			end
+		end
+	end
+	if not best then return false end
+
+	local k = cellKey(best.pos)
+	Bot.Visited[k] = (Bot.Visited[k] or 0) + 1
+	setStatus(best.stretch and "Прыгаю наугад..." or "Паркур: прыжок")
+
+	Bot.Leaping = true
+	local ok = doLeap({ Position = best.pos, Takeoff = best.take }, myHum, myHrp, token)
+	Bot.Leaping = false
+	Bot.Stuck = false
+	if not ok then markFail(best.pos) end
+	return true
+end
+
+local function follow(waypoints, signal, myHum, myHrp, goalRef, token, maxTime)
+	local blocked = false
+	local conn = signal and signal:Connect(function()
+		blocked = true
+	end)
+	local started = os.clock()
+	local abort = false
+	local i = 2
+	Bot.Planned = true
+
+	while i <= #waypoints and not abort do
+		if not active(token) or os.clock() - started > maxTime then
+			break
+		end
+		local wp = waypoints[i]
+		local prevPos = waypoints[i - 1].Position
+		local nextWp = waypoints[i + 1]
+
+		if wp.Kind == "leap" then
+			Bot.Leaping = true
+			local ok = doLeap(wp, myHum, myHrp, token)
+			Bot.Leaping = false
+			Bot.Stuck = false
+			if not ok then
+				markFail(wp.Position)
+				abort = true
+			else
+				local _, _, tHrp = getParts(Bot.Target)
+				if not tHrp
+					or (goalRef and (tHrp.Position - goalRef).Magnitude > CONFIG.TargetMoveThreshold) then
+					abort = true
+				end
+			end
+			i += 1
+			continue
+		end
+
+		Bot.Leaping = nextWp ~= nil and nextWp.Kind == "leap"
+
+		if wp.Native and wp.Action == Enum.PathWaypointAction.Jump then
+			safeJump(myHum, myHrp)
+		end
+
+		local seg = Vector3.new(wp.Position.X - prevPos.X, 0, wp.Position.Z - prevPos.Z)
+		local segLen = seg.Magnitude
+		local sd = segLen > 0.5 and (seg / segLen) or nil
+		myHum:MoveTo(wp.Position)
+
+		local t0 = os.clock()
+		local lastJump = 0
+		local reached = false
+		local edgeHits = 0
+		while os.clock() - t0 < CONFIG.WaypointTimeout do
+			task.wait(0.05)
+			if not active(token) or not myHrp.Parent then
+				abort = true
+				break
+			end
+
+			local _, _, tHrp = getParts(Bot.Target)
+			if not tHrp
+				or (goalRef and (tHrp.Position - goalRef).Magnitude > CONFIG.TargetMoveThreshold) then
+				abort = true
+				break
+			end
+
+			if blocked then
+				abort = true
+				break
+			end
+
+			if Bot.Stuck and not Bot.Leaping then
+				Bot.Stuck = false
+				markFail(wp.Position)
+				abort = true
+				break
+			end
+
+			local pos = myHrp.Position
+			local feet = feetY(myHrp)
+			local rise = wp.Position.Y - feet
+			local flatD = ((wp.Position - pos) * Vector3.new(1, 0, 1)).Magnitude
+
+			local aim = wp.Position
+			local proj = nil
+			if sd then
+				local rel = Vector3.new(pos.X - prevPos.X, 0, pos.Z - prevPos.Z)
+				local t = math.clamp(rel:Dot(sd), 0, segLen)
+				local lateral = (rel - sd * rel:Dot(sd)).Magnitude
+				proj = Vector3.new(prevPos.X + sd.X * t, wp.Position.Y, prevPos.Z + sd.Z * t)
+				if lateral > 2.2 then
+					aim = proj
+				else
+					local la = math.min(t + 3.5, segLen)
+					aim = Vector3.new(prevPos.X + sd.X * la, wp.Position.Y, prevPos.Z + sd.Z * la)
+				end
+			end
+
+			local grounded = myHum.FloorMaterial ~= Enum.Material.Air
+
+			if not Bot.Leaping and grounded then
+				local md = Vector3.new(aim.X - pos.X, 0, aim.Z - pos.Z)
+				if md.Magnitude > 0.2 then
+					local u = md.Unit
+					local g = groundAt(pos + u * 2.2, 3, 14)
+					local drop = g and (feet - g.Position.Y) or math.huge
+					if drop > 4.5 and wp.Position.Y > feet - 2.5 then
+						edgeHits += 1
+						aim = proj or pos
+						if edgeHits > 8 then
+							markFail(wp.Position)
+							abort = true
+							break
+						end
+					end
+				end
+			end
+
+			myHum:MoveTo(aim)
+
+			local slow = flatSpeed(myHrp) < myHum.WalkSpeed * 0.45
+			if grounded and os.clock() - lastJump > 0.45
+				and (rise > 1.3 or (rise > 0.7 and slow))
+				and flatD < math.min(4, 2.2 + rise * 0.35) then
+				lastJump = os.clock()
+				safeJump(myHum, myHrp)
+			end
+
+			if flatD < 2.5 and math.abs(rise) < 4.5 then
+				reached = true
+				break
+			end
+		end
+		if not reached and not abort then
+			markFail(wp.Position)
+			abort = true
+		end
+		i += 1
+	end
+
+	Bot.Leaping = false
+	Bot.Planned = false
+	if conn then conn:Disconnect() end
+end
+
+local function runBot(token)
+	while active(token) do
+		local myChar, myHum, myHrp = getParts(LocalPlayer)
+		local tChar, _, tHrp = getParts(Bot.Target)
+
+		if not (myHum and tHrp) then
+			Bot.Moving = false
+			setStatus("Ожидание персонажа...")
+			task.wait(0.5)
+			continue
+		end
+
+		rayParams.FilterDescendantsInstances = { myChar, tChar }
+
+		local dist = (tHrp.Position - myHrp.Position).Magnitude
+		if dist <= CONFIG.StopDistance then
+			Bot.Moving = false
+			myHum:MoveTo(myHrp.Position)
+			faceTarget(myHrp, tHrp)
+			setStatus("Вплотную к цели ✓")
+			task.wait(0.05)
+			continue
+		end
+
+		if Bot.StuckCount >= 3 then
+			Bot.StuckCount = 0
+			markFail(myHrp.Position)
+			markFail(myHrp.Position)
+			setStatus("Выбираюсь из тупика...")
+			if os.clock() >= Bot.NextClimb and tryClimb(myHum, myHrp, tHrp, token) then
+				Bot.NextClimb = os.clock() + 1
+			else
+				local t = Bot.Trail
+				local back = t[#t - 1] or t[1]
+				if back then
+					myHum:MoveTo(back)
+					task.wait(0.9)
+				end
+			end
+			Bot.Visited = {}
+			Bot.LastDir = nil
+			Bot.NextPathTime = 0
+			continue
+		end
+
+		Bot.Moving = true
+		local heightDiff = math.abs(tHrp.Position.Y - myHrp.Position.Y)
+
+		if heightDiff < 3.5
+			and hasLineOfSight(myHrp.Position, tHrp.Position)
+			and groundOk(myHrp.Position, tHrp.Position)
+		then
+			setStatus("Бегу напрямую...")
+			myHum:MoveTo(tHrp.Position)
+			task.wait(0.05)
+			if Bot.Stuck then
+				Bot.Stuck = false
+				local side = myHrp.CFrame.RightVector * (math.random() < 0.5 and 6 or -6)
+				myHum:MoveTo(myHrp.Position + side)
+				task.wait(0.4)
+			end
+		else
+			if os.clock() >= Bot.NextPathTime then
+				setStatus("Ищу путь...")
+				local path = findPath(myHrp, tHrp, token)
+				if path then
+					Bot.Visited = {}
+					Bot.LastDir = nil
+					setStatus("Иду по маршруту")
+					follow(toList(path), path.Blocked, myHum, myHrp, tHrp.Position, token, CONFIG.MaxFollowTime)
+				else
+					setStatus("Ищу паркур-маршрут...")
+					local waypoints, complete = gridPath(myHrp, tHrp, token, myHum)
+					local usable = waypoints ~= nil and #waypoints > 1
+					local endPos = usable and waypoints[#waypoints].Position or nil
+
+					if usable and complete then
+						Bot.Visited = {}
+						Bot.LastDir = nil
+						setStatus("Иду по проходу/паркуру")
+						follow(waypoints, nil, myHum, myHrp, tHrp.Position, token, GRID.FollowTime)
+						Bot.NextPathTime = 0
+					elseif os.clock() >= Bot.NextClimb and tryClimb(myHum, myHrp, tHrp, token) then
+						Bot.NextClimb = os.clock() + 1
+						Bot.NextPathTime = 0
+					elseif usable then
+						setStatus("Иду искать проход")
+						local k = cellKey(endPos)
+						Bot.Visited[k] = (Bot.Visited[k] or 0) + 3
+						follow(waypoints, nil, myHum, myHrp, nil, token, GRID.FollowTime)
+						markDead(endPos)
+						Bot.NextPathTime = 0
+					else
+						if not desperateLeap(myHum, myHrp, tHrp, token) then
+							Bot.NextPathTime = os.clock() + CONFIG.RepathCooldown
+						end
+					end
+				end
+			else
+				setStatus("Ищу проход...")
+				if os.clock() >= Bot.NextClimb and tryClimb(myHum, myHrp, tHrp, token) then
+					Bot.NextClimb = os.clock() + 1
+				else
+					local leaped = false
+					if os.clock() >= Bot.NextLeap then
+						leaped = desperateLeap(myHum, myHrp, tHrp, token)
+						Bot.NextLeap = os.clock() + (leaped and 0.2 or 0.6)
+					end
+					if not leaped then
+						steerStep(myHum, myHrp, tHrp)
+					end
+				end
+			end
+		end
+	end
+
+Bot.Moving = false
+ Bot.Climbing = false
+ Bot.Leaping = false
+ Bot.Planned = false
+ local _, hum, hrp = getParts(LocalPlayer)
+ if hum and hrp then
+  hum:MoveTo(hrp.Position)
+ end
+end
+
+local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+local old = playerGui:FindFirstChild("FollowBotGui")
+if old then old:Destroy() end
+local oldTag = playerGui:FindFirstChild("FollowBotTag")
+if oldTag then oldTag:Destroy() end
+
+local COLORS = {
+ bg = Color3.fromRGB(16, 16, 26),
+ panel = Color3.fromRGB(24, 24, 38),
+ row = Color3.fromRGB(34, 34, 52),
+rowSelected = Color3.fromRGB(70, 55, 140),
+	accentA = Color3.fromRGB(124, 92, 255),
+	accentB = Color3.fromRGB(0, 190, 255),
+	on = Color3.fromRGB(46, 204, 113),
+	off = Color3.fromRGB(231, 76, 60),
+	text = Color3.fromRGB(240, 240, 250),
+	subtext = Color3.fromRGB(150, 150, 175),
+}
+
+local function corner(parent, radius)
+	local c = Instance.new("UICorner")
+	c.CornerRadius = UDim.new(0, radius)
+	c.Parent = parent
+	return c
+end
+
+local function stroke(parent, color, thickness, transparency)
+	local s = Instance.new("UIStroke")
+	s.Color = color
+	s.Thickness = thickness or 1
+	s.Transparency = transparency or 0
+	s.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+	s.Parent = parent
+	return s
+end
+
+local function gradient(parent, a, b, rotation)
+	local g = Instance.new("UIGradient")
+	g.Color = ColorSequence.new(a, b)
+	g.Rotation = rotation or 0
+	g.Parent = parent
+	return g
+end
+
+local function label(parent, text, size, color, font)
+	local l = Instance.new("TextLabel")
+	l.BackgroundTransparency = 1
+	l.Text = text
+	l.TextSize = size
+	l.TextColor3 = color or COLORS.text
+	l.Font = font or Enum.Font.GothamMedium
+	l.TextXAlignment = Enum.TextXAlignment.Left
+	l.Parent = parent
+	return l
+end
+
+local gui = Instance.new("ScreenGui")
+gui.Name = "FollowBotGui"
+gui.ResetOnSpawn = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent = playerGui
+
+local ESP = { Highlight = nil, Tag = nil, Name = nil, Info = nil, Char = nil }
+
+local function clearESP()
+	if ESP.Highlight then ESP.Highlight:Destroy() end
+	if ESP.Tag then ESP.Tag:Destroy() end
+	ESP.Highlight, ESP.Tag, ESP.Name, ESP.Info, ESP.Char = nil, nil, nil, nil, nil
+end
+
+local function buildESP(plr, char)
+	clearESP()
+	local head = char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
+	if not head then return end
+
+	local hl = Instance.new("Highlight")
+	hl.Name = "FollowBotESP"
+	hl.Adornee = char
+	hl.FillColor = COLORS.accentA
+	hl.FillTransparency = 0.55
+	hl.OutlineColor = Color3.new(1, 1, 1)
+	hl.OutlineTransparency = 0
+	hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+	hl.Parent = gui
+
+	local bb = Instance.new("BillboardGui")
+	bb.Name = "FollowBotTag"
+	bb.Adornee = head
+	bb.Size = UDim2.fromOffset(220, 46)
+	bb.StudsOffset = Vector3.new(0, 3.2, 0)
+	bb.AlwaysOnTop = true
+	bb.ResetOnSpawn = false
+	bb.Parent = playerGui
+
+	local nameLbl = Instance.new("TextLabel")
+	nameLbl.Size = UDim2.new(1, 0, 0, 24)
+	nameLbl.BackgroundTransparency = 1
+	nameLbl.Font = Enum.Font.GothamBold
+	nameLbl.TextSize = 18
+	nameLbl.TextColor3 = Color3.new(1, 1, 1)
+	nameLbl.TextStrokeTransparency = 0.3
+	nameLbl.TextStrokeColor3 = Color3.new(0, 0, 0)
+	nameLbl.Text = plr.DisplayName == plr.Name and plr.Name
+		or (plr.DisplayName .. " (@" .. plr.Name .. ")")
+	nameLbl.Parent = bb
+
+	local infoLbl = Instance.new("TextLabel")
+	infoLbl.Size = UDim2.new(1, 0, 0, 18)
+	infoLbl.Position = UDim2.fromOffset(0, 24)
+	infoLbl.BackgroundTransparency = 1
+	infoLbl.Font = Enum.Font.GothamMedium
+	infoLbl.TextSize = 14
+	infoLbl.TextColor3 = COLORS.accentB
+	infoLbl.TextStrokeTransparency = 0.3
+	infoLbl.TextStrokeColor3 = Color3.new(0, 0, 0)
+	infoLbl.Text = ""
+	infoLbl.Parent = bb
+
+	ESP.Highlight, ESP.Tag, ESP.Name, ESP.Info, ESP.Char = hl, bb, nameLbl, infoLbl, char
+end
+
+local function espLoop(token)
+	while active(token) do
+		local plr = Bot.Target
+		if plr and plr.Character and plr.Character ~= ESP.Char then
+			buildESP(plr, plr.Character)
+		end
+
+		local _, hum, hrp = getParts(plr)
+		local _, _, myHrp = getParts(LocalPlayer)
+		if ESP.Info and hum and hrp and myHrp then
+			local dist = (hrp.Position - myHrp.Position).Magnitude
+			ESP.Info.Text = string.format("%d studs   ❤ %d", dist, hum.Health)
+		end
+		task.wait(0.1)
+	end
+	clearESP()
+end
+
+local main = Instance.new("Frame")
+main.Name = "Main"
+main.Size = UDim2.fromOffset(300, 420)
+main.Position = UDim2.new(0.5, -150, 0.5, -210)
+main.BackgroundColor3 = COLORS.bg
+main.BorderSizePixel = 0
+main.ClipsDescendants = true
+main.Parent = gui
+corner(main, 16)
+stroke(main, COLORS.accentA, 1.5, 0.35)
+local header = Instance.new("Frame")
+header.Size = UDim2.new(1, 0, 0, 48)
+header.BackgroundColor3 = COLORS.accentA
+header.BorderSizePixel = 0
+header.Parent = main
+gradient(header, COLORS.accentA, COLORS.accentB, 20)
+
+local title = label(header, "🤖  Follow Bot", 18, Color3.new(1, 1, 1), Enum.Font.GothamBold)
+title.Size = UDim2.new(1, -90, 1, 0)
+title.Position = UDim2.fromOffset(16, 0)
+
+local function headerButton(text, xOffset)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.fromOffset(28, 28)
+	b.Position = UDim2.new(1, xOffset, 0.5, -14)
+	b.BackgroundColor3 = Color3.new(1, 1, 1)
+	b.BackgroundTransparency = 0.8
+	b.Text = text
+	b.TextColor3 = Color3.new(1, 1, 1)
+	b.TextSize = 16
+	b.Font = Enum.Font.GothamBold
+	b.AutoButtonColor = false
+	b.Parent = header
+	corner(b, 8)
+	b.MouseEnter:Connect(function()
+		TweenService:Create(b, TweenInfo.new(0.15), { BackgroundTransparency = 0.55 }):Play()
+	end)
+	b.MouseLeave:Connect(function()
+		TweenService:Create(b, TweenInfo.new(0.15), { BackgroundTransparency = 0.8 }):Play()
+	end)
+	return b
+end
+
+local minBtn = headerButton("–", -70)
+local closeBtn = headerButton("✕", -36)
+
+local body = Instance.new("Frame")
+body.Name = "Body"
+body.Size = UDim2.new(1, 0, 1, -48)
+body.Position = UDim2.fromOffset(0, 48)
+body.BackgroundTransparency = 1
+body.Parent = main
+
+local searchBox = Instance.new("TextBox")
+searchBox.Size = UDim2.new(1, -24, 0, 34)
+searchBox.Position = UDim2.fromOffset(12, 12)
+searchBox.BackgroundColor3 = COLORS.panel
+searchBox.PlaceholderText = "🔍  Поиск игрока..."
+searchBox.PlaceholderColor3 = COLORS.subtext
+searchBox.Text = ""
+searchBox.TextColor3 = COLORS.text
+searchBox.TextSize = 14
+searchBox.Font = Enum.Font.Gotham
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = body
+corner(searchBox, 10)
+stroke(searchBox, COLORS.accentA, 1, 0.7)
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(1, -24, 1, -190)
+list.Position = UDim2.fromOffset(12, 56)
+list.BackgroundColor3 = COLORS.panel
+list.BorderSizePixel = 0
+list.ScrollBarThickness = 4
+list.ScrollBarImageColor3 = COLORS.accentA
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.CanvasSize = UDim2.new()
+list.Parent = body
+corner(list, 12)
+
+local listLayout = Instance.new("UIListLayout")
+listLayout.Padding = UDim.new(0, 6)
+listLayout.SortOrder = Enum.SortOrder.Name
+listLayout.Parent = list
+
+local listPadding = Instance.new("UIPadding")
+listPadding.PaddingTop = UDim.new(0, 6)
+listPadding.PaddingBottom = UDim.new(0, 6)
+listPadding.PaddingLeft = UDim.new(0, 6)
+listPadding.PaddingRight = UDim.new(0, 6)
+listPadding.Parent = list
+
+local targetLabel = label(body, "Цель: не выбрана", 14, COLORS.subtext, Enum.Font.GothamMedium)
+targetLabel.Size = UDim2.new(1, -24, 0, 20)
+targetLabel.Position = UDim2.new(0, 12, 1, -126)
+targetLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+local statusLabel = label(body, "Статус: ожидание", 13, COLORS.subtext, Enum.Font.Gotham)
+statusLabel.Size = UDim2.new(1, -24, 0, 18)
+statusLabel.Position = UDim2.new(0, 12, 1, -104)
+statusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+statusCallback = function(text)
+	statusLabel.Text = "Статус: " .. text
+end
+
+local toggle = Instance.new("TextButton")
+toggle.Size = UDim2.new(1, -24, 0, 46)
+toggle.Position = UDim2.new(0, 12, 1, -78)
+toggle.BackgroundColor3 = COLORS.off
+toggle.Text = "▶  Бежать до цели: ВЫКЛ"
+toggle.TextColor3 = Color3.new(1, 1, 1)
+toggle.TextSize = 16
+toggle.Font = Enum.Font.GothamBold
+toggle.AutoButtonColor = false
+toggle.Parent = body
+corner(toggle, 12)
+stroke(toggle, Color3.new(1, 1, 1), 1, 0.8)
+
+local thumbCache = {}
+
+local function selectPlayer(plr)
+	Bot.Target = plr
+	resetMemory()
+	targetLabel.Text = "Цель: " .. plr.DisplayName .. " (@" .. plr.Name .. ")"
+	targetLabel.TextColor3 = COLORS.text
+	for _, row in ipairs(list:GetChildren()) do
+		if row:IsA("Frame") then
+			local selected = row.Name == plr.Name
+			TweenService:Create(row, TweenInfo.new(0.2), {
+				BackgroundColor3 = selected and COLORS.rowSelected or COLORS.row,
+			}):Play()
+		end
+	end
+end
+
+local function makeRow(plr)
+	local row = Instance.new("Frame")
+	row.Name = plr.Name
+	row.Size = UDim2.new(1, 0, 0, 48)
+	row.BackgroundColor3 = (Bot.Target == plr) and COLORS.rowSelected or COLORS.row
+	row.BorderSizePixel = 0
+	row.Parent = list
+	corner(row, 10)
+
+	local avatar = Instance.new("ImageLabel")
+	avatar.Size = UDim2.fromOffset(36, 36)
+	avatar.Position = UDim2.fromOffset(6, 6)
+	avatar.BackgroundColor3 = COLORS.bg
+	avatar.BorderSizePixel = 0
+	avatar.Parent = row
+	corner(avatar, 18)
+
+	if thumbCache[plr.UserId] then
+		avatar.Image = thumbCache[plr.UserId]
+	else
+		task.spawn(function()
+			local ok, img = pcall(function()
+				return Players:GetUserThumbnailAsync(
+					plr.UserId,
+					Enum.ThumbnailType.HeadShot,
+					Enum.ThumbnailSize.Size100x100
+				)
+			end)
+			if ok and img then
+				thumbCache[plr.UserId] = img
+				if avatar.Parent then avatar.Image = img end
+			end
+		end)
+	end
+
+	local nameLbl = label(row, plr.DisplayName, 14, COLORS.text, Enum.Font.GothamBold)
+	nameLbl.Size = UDim2.new(1, -60, 0, 20)
+	nameLbl.Position = UDim2.fromOffset(52, 6)
+	nameLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+	local userLbl = label(row, "@" .. plr.Name, 12, COLORS.subtext, Enum.Font.Gotham)
+	userLbl.Size = UDim2.new(1, -60, 0, 16)
+	userLbl.Position = UDim2.fromOffset(52, 26)
+	userLbl.TextTruncate = Enum.TextTruncate.AtEnd
+
+	local btn = Instance.new("TextButton")
+	btn.Size = UDim2.fromScale(1, 1)
+	btn.BackgroundTransparency = 1
+	btn.Text = ""
+	btn.Parent = row
+	btn.MouseButton1Click:Connect(function()
+		selectPlayer(plr)
+	end)
+	btn.MouseEnter:Connect(function()
+		if Bot.Target ~= plr then
+			TweenService:Create(row, TweenInfo.new(0.15), {
+				BackgroundColor3 = Color3.fromRGB(46, 46, 70),
+			}):Play()
+		end
+	end)
+	btn.MouseLeave:Connect(function()
+		if Bot.Target ~= plr then
+			TweenService:Create(row, TweenInfo.new(0.15), { BackgroundColor3 = COLORS.row }):Play()
+		end
+	end)
+end
+
+local function refreshList()
+	for _, c in ipairs(list:GetChildren()) do
+		if c:IsA("Frame") then c:Destroy() end
+	end
+	local q = searchBox.Text:lower()
+	for _, plr in ipairs(Players:GetPlayers()) do
+		if plr ~= LocalPlayer then
+			if q == "" or plr.Name:lower():find(q, 1, true) or plr.DisplayName:lower():find(q, 1, true) then
+				makeRow(plr)
+			end
+		end
+	end
+end
+
+searchBox:GetPropertyChangedSignal("Text"):Connect(refreshList)
+
+Players.PlayerAdded:Connect(refreshList)
+Players.PlayerRemoving:Connect(function(plr)
+	if Bot.Target == plr then
+		Bot.Target = nil
+		targetLabel.Text = "Цель: покинула сервер"
+		targetLabel.TextColor3 = COLORS.subtext
+		if Bot.Running then
+			Bot.Running = false
+			Bot.Token += 1
+			TweenService:Create(toggle, TweenInfo.new(0.25), { BackgroundColor3 = COLORS.off }):Play()
+			toggle.Text = "▶  Бежать до цели: ВЫКЛ"
+			setStatus("цель ушла")
+		end
+		clearESP()
+	end
+	task.defer(refreshList)
+end)
+
+local function setRunning(state)
+	if state and not Bot.Target then
+		setStatus("сначала выберите игрока")
+		TweenService:Create(toggle, TweenInfo.new(0.1), { Position = UDim2.new(0, 18, 1, -78) }):Play()
+		task.delay(0.1, function()
+			TweenService:Create(toggle, TweenInfo.new(0.1), { Position = UDim2.new(0, 12, 1, -78) }):Play()
+		end)
+		return
+	end
+
+	Bot.Running = state
+	Bot.Token += 1
+	Bot.Climbing = false
+	Bot.Steps = 0
+	Sword = nil
+	resetMemory()
+
+	if state then
+		toggle.Text = "■  Бежать до цели: ВКЛ"
+		TweenService:Create(toggle, TweenInfo.new(0.25), { BackgroundColor3 = COLORS.on }):Play()
+		task.spawn(runBot, Bot.Token)
+		task.spawn(attackLoop, Bot.Token)
+		task.spawn(espLoop, Bot.Token)
+	else
+		toggle.Text = "▶  Бежать до цели: ВЫКЛ"
+		TweenService:Create(toggle, TweenInfo.new(0.25), { BackgroundColor3 = COLORS.off }):Play()
+		setStatus("остановлено")
+		clearESP()
+	end
+end
+
+toggle.MouseButton1Click:Connect(function()
+	setRunning(not Bot.Running)
+end)
+
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+	minimized = not minimized
+	body.Visible = not minimized
+	TweenService:Create(main, TweenInfo.new(0.25, Enum.EasingStyle.Quad), {
+		Size = minimized and UDim2.fromOffset(300, 48) or UDim2.fromOffset(300, 420),
+	}):Play()
+	minBtn.Text = minimized and "+" or "–"
+end)
+
+closeBtn.MouseButton1Click:Connect(function()
+	Bot.Running = false
+	Bot.Token += 1
+	clearESP()
+	gui:Destroy()
+end)
+
+do
+	local dragging, dragStart, startPos
+	header.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = main.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch) then
+			local delta = input.Position - dragStart
+			main.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end)
+end
+
+main.Size = UDim2.fromOffset(300, 0)
+TweenService:Create(main, TweenInfo.new(0.35, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+	Size = UDim2.fromOffset(300, 420),
+}):Play()
+
+refreshList()
